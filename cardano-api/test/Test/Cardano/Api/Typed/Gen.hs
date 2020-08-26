@@ -244,7 +244,7 @@ genShelleyKeyWitness =
 genShelleyWitness :: Gen (Witness Shelley)
 genShelleyWitness = Gen.choice [genShelleyKeyWitness, genShelleyBootstrapWitness]
 
-genShelleyWitnessSigningKey :: Gen ShelleyWitnessSigningKey
+genShelleyWitnessSigningKey :: Gen ShelleyWitnessKeyOrScript
 genShelleyWitnessSigningKey =
   Gen.choice [ WitnessPaymentKey <$>  genSigningKey AsPaymentKey
              , WitnessPaymentExtendedKey <$>  genSigningKey AsPaymentExtendedKey
