@@ -9,18 +9,20 @@ module Cardano.CLI.Shelley.Run.Transaction
   , runTransactionCmd
   ) where
 
-import           Cardano.Prelude
+import           Cardano.Prelude hiding (All, Any)
 import           Prelude (String)
 
 import qualified Data.Aeson as Aeson
+import           Data.Aeson.Encode.Pretty (encodePretty)
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Lazy.Char8 as C8
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Text as Text
 
 import           Control.Monad.Trans.Except (ExceptT)
 import           Control.Monad.Trans.Except.Extra (firstExceptT, handleIOExceptT, hoistEither, left,
-                     newExceptT)
+                     newExceptT, right)
 
 --TODO: do this nicely via the API too:
 import qualified Cardano.Binary as CBOR
@@ -46,6 +48,7 @@ import           Cardano.Api.Typed as Api
 
 data ShelleyTxCmdError
   = ShelleyTxAesonDecodeProtocolParamsError !FilePath !Text
+  | ShelleyTxAesonDecodeMultiSigScriptError !FilePath !Text
   | ShelleyTxMetaDataFileError !FilePath !IOException
   | ShelleyTxMetaDataConversionError !FilePath !MetaDataJsonConversionError
   | ShelleyTxMetaDecodeError !FilePath !CBOR.DecoderError
@@ -62,6 +65,7 @@ data ShelleyTxCmdError
   | ShelleyTxSubmitErrorShelley !(ApplyTxErr (ShelleyBlock TPraosStandardCrypto))
   | ShelleyTxSubmitErrorEraMismatch !EraMismatch
   | ShelleyTxReadFileError !(Api.FileError Api.TextEnvelopeError)
+  | ShelleyTxReadFileException !(Api.FileError ())
   | ShelleyTxWriteFileError !(Api.FileError ())
   deriving Show
 
@@ -90,6 +94,10 @@ renderShelleyTxCmdError err =
     ShelleyTxAesonDecodeProtocolParamsError fp decErr ->
       "Error while decoding the protocol parameters at: " <> show fp
                                             <> " Error: " <> show decErr
+    ShelleyTxAesonDecodeMultiSigScriptError fp decErr ->
+      "Error while decoding the multisig script at: " <> show fp
+                                            <> " Error: " <> show decErr
+
     ShelleyTxCertReadError err' ->
       "Error reading shelley certificate at: " <> Text.pack (Api.displayError err')
     ShelleyTxWriteSignedTxError err' ->
@@ -104,6 +112,7 @@ renderShelleyTxCmdError err =
       "The era of the node and the tx do not match. " <>
       "The node is running in the " <> ledgerEraName <>
       " era, but the transaction is for the " <> otherEraName <> " era."
+    ShelleyTxReadFileException fileErr -> Text.pack (Api.displayError fileErr)
     ShelleyTxReadFileError fileErr -> Text.pack (Api.displayError fileErr)
     ShelleyTxWriteFileError fileErr -> Text.pack (Api.displayError fileErr)
     ShelleyTxMissingNetworkId -> "Please enter network id with your byron transaction"
@@ -113,6 +122,7 @@ runTransactionCmd cmd =
   case cmd of
     TxBuildRaw txins txouts ttl fee certs wdrls mMetaData mUpProp out ->
       runTxBuildRaw txins txouts ttl fee certs wdrls mMetaData mUpProp out
+    TxBuildMultiSig mScriptObj mOutputFile -> runTxBuildMultiSig mScriptObj mOutputFile
     TxSign txinfile skfiles network txoutfile ->
       runTxSign txinfile skfiles network txoutfile
     TxSubmit protocol network txFp ->
@@ -123,9 +133,9 @@ runTransactionCmd cmd =
                            nShelleyKeyWitnesses nByronKeyWitnesses
     TxGetTxId txinfile ->
       runTxGetTxId txinfile
-    TxWitness txBodyfile witSignKeyFile mbNw outFile ->
-      runTxWitness txBodyfile witSignKeyFile mbNw outFile
-    TxSignWitness txBodyFile witnessFile outFile ->
+    TxCreateWitness txBodyfile sKeyOrScript mbNw outFile ->
+      runTxCreateWitness txBodyfile sKeyOrScript mbNw outFile
+    TxAssembleTxBodyWitness txBodyFile witnessFile outFile ->
       runTxSignWitness txBodyFile witnessFile outFile
 
 runTxBuildRaw
@@ -184,32 +194,52 @@ runTxSign :: TxBodyFile
           -> Maybe Api.NetworkId
           -> TxFile
           -> ExceptT ShelleyTxCmdError IO ()
-runTxSign (TxBodyFile txbodyFile) skFiles mnw (TxFile txFile) = do
+runTxSign (TxBodyFile txbodyFile) skFiles (Just nw) (TxFile txFile) = do
     txbody <- firstExceptT ShelleyTxReadUnsignedTxError . newExceptT $
                 Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
-    sks    <- firstExceptT ShelleyTxReadFileError $
-                mapM readSigningKeyFile skFiles
+    sks    <- mapM readSigningKeyFile skFiles
 
-    -- We have to handle Byron and Shelley key witnesses slightly differently
-    let (sksByron, sksShelley) = partitionEithers (map categoriseWitnessSigningKey sks)
+    let (sksByron, sksShelley) = filterPotentialWitnesses $ map categorisePotentialWitness sks
 
     -- Byron witnesses need the network id
-    witnessesByron <-
-      case (sksByron, mnw) of
-        ([], Nothing) -> return []
-        (_,  Nothing) -> throwError ShelleyTxMissingNetworkId
-        (_,  Just nw) ->
-          return $ map (Api.makeShelleyBootstrapWitness nw txbody) sksByron
-
-    let witnesses :: [Api.Witness Api.Shelley]
-        witnesses = witnessesByron
-                 ++ map (Api.makeShelleyKeyWitness txbody) sksShelley
-
-        tx        :: Api.Tx Api.Shelley
-        tx        = Api.makeSignedTransaction witnesses txbody
+    let witnessesByron = map (Api.makeShelleyBootstrapWitness nw txbody) sksByron
+        witnessesShelley = map (Api.makeShelleyKeyWitness txbody) sksShelley
+        tx :: Api.Tx Api.Shelley
+        tx = Api.makeSignedTransaction (witnessesByron ++ witnessesShelley) txbody
 
     firstExceptT ShelleyTxWriteSignedTxError . newExceptT $
       Api.writeFileTextEnvelope txFile Nothing tx
+
+runTxSign (TxBodyFile txbodyFile) skFiles Nothing (TxFile txFile) = do
+    txbody <- firstExceptT ShelleyTxReadUnsignedTxError . newExceptT $
+                Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
+    sks    <- mapM readSigningKeyFile skFiles
+
+    witnesses <- case filterPotentialWitnesses $ map categorisePotentialWitness sks of
+                   ([], sksShelley) -> return $ map (Api.makeShelleyKeyWitness txbody) sksShelley
+                   (_, _) -> throwError ShelleyTxMissingNetworkId
+
+    let tx :: Api.Tx Api.Shelley
+        tx = Api.makeSignedTransaction witnesses txbody
+
+    firstExceptT ShelleyTxWriteSignedTxError . newExceptT $
+      Api.writeFileTextEnvelope txFile Nothing tx
+
+
+filterPotentialWitnesses
+  :: [ByronOrShelleyWitness]
+  -> ([(Api.SigningKey Api.ByronKey)], [Api.ShelleyWitnessKeyOrScript])
+filterPotentialWitnesses [] = ([], [])
+filterPotentialWitnesses (wt' : rest') =
+  go wt' rest' ([], [])
+ where go wt [] (bwl, swl) =
+         case wt of
+           ByronWitness bw -> (bwl ++ [bw], swl)
+           ShelleyWitness sw -> (bwl, swl ++ [sw])
+       go wt (next : rest) (bwl, swl) =
+         case wt of
+           ByronWitness bw -> go next rest (bwl ++ [bw], swl)
+           ShelleyWitness sw -> go next rest (bwl, swl ++ [sw])
 
 runTxSubmit :: Protocol -> NetworkId -> FilePath
             -> ExceptT ShelleyTxCmdError IO ()
@@ -301,7 +331,7 @@ readProtocolParameters (ProtocolParamsFile fpath) = do
   firstExceptT (ShelleyTxAesonDecodeProtocolParamsError fpath . Text.pack) . hoistEither $
     Aeson.eitherDecode' pparams
 
-data SomeWitnessSigningKey
+data PotentialWitness
   = AByronSigningKey           (Api.SigningKey Api.ByronKey)
   | APaymentSigningKey         (Api.SigningKey Api.PaymentKey)
   | APaymentExtendedSigningKey (Api.SigningKey Api.PaymentExtendedKey)
@@ -314,13 +344,28 @@ data SomeWitnessSigningKey
   | AGenesisDelegateExtendedSigningKey
                                (Api.SigningKey Api.GenesisDelegateExtendedKey)
   | AGenesisUTxOSigningKey     (Api.SigningKey Api.GenesisUTxOKey)
+  | AShelleyMultiSigScript     Api.MultiSigScript
+
+readPotentialWitness
+  :: SigningKeyOrScriptFile
+  -> ExceptT ShelleyTxCmdError IO PotentialWitness
+readPotentialWitness scriptOrSkey =
+   case scriptOrSkey of
+     SigningKeyFileForWitness fp -> readSigningKeyFile $ SigningKeyFile fp
+     ScriptFileForWitness fp -> do
+       msJson <- handleIOExceptT (ShelleyTxReadFileException . FileIOError fp)
+                   $ LBS.readFile fp
+       case Aeson.eitherDecode msJson of
+         Right ms -> right $ AShelleyMultiSigScript ms
+         Left decErr -> left . ShelleyTxAesonDecodeMultiSigScriptError fp $ Text.pack decErr
+
 
 readSigningKeyFile
   :: SigningKeyFile
-  -> ExceptT (Api.FileError Api.TextEnvelopeError) IO SomeWitnessSigningKey
+  -> ExceptT ShelleyTxCmdError IO PotentialWitness
 readSigningKeyFile (SigningKeyFile skfile) =
-    newExceptT $
-      Api.readFileTextEnvelopeAnyOf fileTypes skfile
+    firstExceptT ShelleyTxReadFileError . newExceptT
+      $ Api.readFileTextEnvelopeAnyOf fileTypes skfile
   where
     fileTypes =
       [ Api.FromSomeType (Api.AsSigningKey Api.AsByronKey)
@@ -346,24 +391,25 @@ readSigningKeyFile (SigningKeyFile skfile) =
       , Api.FromSomeType (Api.AsSigningKey Api.AsGenesisUTxOKey)
                           AGenesisUTxOSigningKey
       ]
+data ByronOrShelleyWitness = ByronWitness (Api.SigningKey Api.ByronKey)
+                           | ShelleyWitness Api.ShelleyWitnessKeyOrScript
 
-categoriseWitnessSigningKey :: SomeWitnessSigningKey
-                            -> Either (Api.SigningKey Api.ByronKey)
-                                       Api.ShelleyWitnessSigningKey
-categoriseWitnessSigningKey swsk =
+categorisePotentialWitness :: PotentialWitness -> ByronOrShelleyWitness
+categorisePotentialWitness swsk =
   case swsk of
-    AByronSigningKey           sk -> Left sk
-    APaymentSigningKey         sk -> Right (Api.WitnessPaymentKey         sk)
-    APaymentExtendedSigningKey sk -> Right (Api.WitnessPaymentExtendedKey sk)
-    AStakeSigningKey           sk -> Right (Api.WitnessStakeKey           sk)
-    AStakeExtendedSigningKey   sk -> Right (Api.WitnessStakeExtendedKey   sk)
-    AStakePoolSigningKey       sk -> Right (Api.WitnessStakePoolKey       sk)
-    AGenesisSigningKey         sk -> Right (Api.WitnessGenesisKey sk)
-    AGenesisExtendedSigningKey sk -> Right (Api.WitnessGenesisExtendedKey sk)
-    AGenesisDelegateSigningKey sk -> Right (Api.WitnessGenesisDelegateKey sk)
+    AByronSigningKey           sk -> ByronWitness sk
+    APaymentSigningKey         sk -> ShelleyWitness (Api.WitnessPaymentKey         sk)
+    APaymentExtendedSigningKey sk -> ShelleyWitness (Api.WitnessPaymentExtendedKey sk)
+    AStakeSigningKey           sk -> ShelleyWitness (Api.WitnessStakeKey           sk)
+    AStakeExtendedSigningKey   sk -> ShelleyWitness (Api.WitnessStakeExtendedKey   sk)
+    AStakePoolSigningKey       sk -> ShelleyWitness (Api.WitnessStakePoolKey       sk)
+    AGenesisSigningKey         sk -> ShelleyWitness (Api.WitnessGenesisKey sk)
+    AGenesisExtendedSigningKey sk -> ShelleyWitness (Api.WitnessGenesisExtendedKey sk)
+    AGenesisDelegateSigningKey sk -> ShelleyWitness (Api.WitnessGenesisDelegateKey sk)
     AGenesisDelegateExtendedSigningKey sk
-                                  -> Right (Api.WitnessGenesisDelegateExtendedKey sk)
-    AGenesisUTxOSigningKey     sk -> Right (Api.WitnessGenesisUTxOKey     sk)
+                                  -> ShelleyWitness (Api.WitnessGenesisDelegateExtendedKey sk)
+    AGenesisUTxOSigningKey     sk -> ShelleyWitness (Api.WitnessGenesisUTxOKey     sk)
+    AShelleyMultiSigScript scr    -> ShelleyWitness $ WitnessMultiSig scr
 
 runTxGetTxId :: TxBodyFile -> ExceptT ShelleyTxCmdError IO ()
 runTxGetTxId (TxBodyFile txbodyFile) = do
@@ -371,46 +417,78 @@ runTxGetTxId (TxBodyFile txbodyFile) = do
               Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
   liftIO $ BS.putStrLn $ Api.serialiseToRawBytesHex (Api.getTxId txbody)
 
-runTxWitness
+runTxCreateWitness
   :: TxBodyFile
-  -> SigningKeyFile
+  -> SigningKeyOrScriptFile
   -> Maybe NetworkId
   -> OutputFile
   -> ExceptT ShelleyTxCmdError IO ()
-runTxWitness (TxBodyFile txbodyFile) witSignKeyFile mbNw (OutputFile oFile) = do
+runTxCreateWitness (TxBodyFile txbodyFile) sKeyOrScript (Just nw) (OutputFile oFile) = do
   txbody <- firstExceptT ShelleyTxReadFileError . newExceptT $
               Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
-  someWitSignKey <- firstExceptT ShelleyTxReadFileError $ readSigningKeyFile witSignKeyFile
+  potWit <- readPotentialWitness sKeyOrScript
 
-  witness <-
-    case (categoriseWitnessSigningKey someWitSignKey, mbNw) of
-      -- Byron witnesses require the network ID.
-      (Left _, Nothing) -> throwError ShelleyTxMissingNetworkId
-      (Left byronSk, Just nw) -> pure $ makeShelleyBootstrapWitness nw txbody byronSk
-      (Right shelleySk, _) -> pure $ makeShelleyKeyWitness txbody shelleySk
+  witness <- case categorisePotentialWitness potWit of
+               ShelleyWitness skShelley -> return $ makeShelleyKeyWitness txbody skShelley
+               ByronWitness skByron -> return $ makeShelleyBootstrapWitness nw txbody skByron
 
   firstExceptT ShelleyTxWriteFileError
     . newExceptT
     $ Api.writeFileTextEnvelope oFile Nothing witness
 
-runTxSignWitness :: TxBodyFile -> [WitnessFile] -> OutputFile -> ExceptT ShelleyTxCmdError IO ()
-runTxSignWitness (TxBodyFile txBodyFile) witnessFiles (OutputFile oFp) = do
-    txBody <- firstExceptT ShelleyTxReadFileError
-      . newExceptT
-      $ Api.readFileTextEnvelope Api.AsShelleyTxBody txBodyFile
-    witnesses <- firstExceptT ShelleyTxReadFileError
-      $ mapM readWitnessFile witnessFiles
-    let tx = Api.makeSignedTransaction witnesses txBody
-    firstExceptT ShelleyTxWriteFileError
-      . newExceptT
-      $ Api.writeFileTextEnvelope oFp Nothing tx
-  where
-    readWitnessFile
-      :: WitnessFile
-      -> ExceptT (Api.FileError Api.TextEnvelopeError) IO (Witness Shelley)
-    readWitnessFile (WitnessFile fp) =
-      newExceptT (Api.readFileTextEnvelope AsShelleyWitness fp)
+runTxCreateWitness (TxBodyFile txbodyFile) sKeyOrScript Nothing (OutputFile oFile) = do
+  txbody <- firstExceptT ShelleyTxReadFileError . newExceptT $
+              Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
+  potWit <- readPotentialWitness sKeyOrScript
 
+  witness <- case categorisePotentialWitness potWit of
+               ShelleyWitness skShelley -> return $ makeShelleyKeyWitness txbody skShelley
+               ByronWitness _ -> throwError ShelleyTxMissingNetworkId
+
+  firstExceptT ShelleyTxWriteFileError
+    . newExceptT
+    $ Api.writeFileTextEnvelope oFile Nothing witness
+
+runTxSignWitness
+  :: TxBodyFile
+  -> [WitnessFile]
+  -> OutputFile
+  -> ExceptT ShelleyTxCmdError IO ()
+runTxSignWitness (TxBodyFile txBodyFile) witnessFiles (OutputFile oFp) = do
+    txBody <- firstExceptT ShelleyTxReadFileError . newExceptT
+                $ Api.readFileTextEnvelope Api.AsShelleyTxBody txBodyFile
+    witnesses <- mapM readWitnessFile witnessFiles
+
+    let tx = Api.makeSignedTransaction witnesses txBody
+
+    firstExceptT ShelleyTxWriteFileError . newExceptT
+      $ Api.writeFileTextEnvelope oFp Nothing tx
+
+readWitnessFile :: WitnessFile -> ExceptT ShelleyTxCmdError IO (Witness Shelley)
+readWitnessFile (WitnessFile fp) =
+  firstExceptT ShelleyTxReadFileError $ newExceptT (Api.readFileTextEnvelope AsShelleyWitness fp)
+
+runTxBuildMultiSig :: MultiSigScriptObject -> Maybe OutputFile -> ExceptT ShelleyTxCmdError IO ()
+runTxBuildMultiSig msso mOutputFile = do
+  ms <- convertToMultiSig msso
+  case mOutputFile of
+    Just (OutputFile outFp) -> liftIO $ LBS.writeFile outFp $ encodePretty ms
+    Nothing -> liftIO . C8.putStrLn $ encodePretty ms
+ where
+  readPaymentVerificationKeys :: [VerificationKeyFile] -> ExceptT ShelleyTxCmdError IO [VerificationKey PaymentKey]
+  readPaymentVerificationKeys fps = do
+    eVerKeys <- liftIO $ mapM (readFileTextEnvelope (AsVerificationKey AsPaymentKey) . unVerificationKeyFile) fps
+    sequence $ map (firstExceptT ShelleyTxReadFileError . hoistEither) eVerKeys
+
+  convertToMultiSig :: MultiSigScriptObject -> ExceptT ShelleyTxCmdError IO MultiSigScript
+  convertToMultiSig so =
+    case so of
+      All payKeyfps -> do payKeys <- readPaymentVerificationKeys payKeyfps
+                          right . RequireAllOf $ map (RequireSignature . verificationKeyHash) payKeys
+      Any payKeyfps -> do payKeys <- readPaymentVerificationKeys payKeyfps
+                          right . RequireAnyOf $ map (RequireSignature . verificationKeyHash) payKeys
+      AtLeast req payKeyFps -> do payKeys <- readPaymentVerificationKeys payKeyFps
+                                  right . RequireMOf req $ map (RequireSignature . verificationKeyHash) payKeys
 -- ----------------------------------------------------------------------------
 -- Transaction metadata
 --
