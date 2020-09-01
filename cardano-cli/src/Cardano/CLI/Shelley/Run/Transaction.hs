@@ -35,6 +35,7 @@ import           Ouroboros.Consensus.Shelley.Ledger (ShelleyBlock)
 import           Ouroboros.Consensus.Shelley.Protocol.Crypto (TPraosStandardCrypto)
 
 import           Cardano.CLI.Environment (EnvSocketError, readEnvSocketPath, renderEnvSocketError)
+import           Cardano.CLI.Shelley.Key (SigningKeyDecodeError (..), readSigningKeyFileAnyOf)
 import           Cardano.CLI.Shelley.Parsers
 import           Cardano.CLI.Types
 
@@ -62,6 +63,7 @@ data ShelleyTxCmdError
   | ShelleyTxSubmitErrorShelley !(ApplyTxErr (ShelleyBlock TPraosStandardCrypto))
   | ShelleyTxSubmitErrorEraMismatch !EraMismatch
   | ShelleyTxReadFileError !(Api.FileError Api.TextEnvelopeError)
+  | ShelleyTxReadSigningKeyFileError !(Api.FileError SigningKeyDecodeError)
   | ShelleyTxWriteFileError !(Api.FileError ())
   deriving Show
 
@@ -105,6 +107,7 @@ renderShelleyTxCmdError err =
       "The node is running in the " <> ledgerEraName <>
       " era, but the transaction is for the " <> otherEraName <> " era."
     ShelleyTxReadFileError fileErr -> Text.pack (Api.displayError fileErr)
+    ShelleyTxReadSigningKeyFileError fileErr -> Text.pack (Api.displayError fileErr)
     ShelleyTxWriteFileError fileErr -> Text.pack (Api.displayError fileErr)
     ShelleyTxMissingNetworkId -> "Please enter network id with your byron transaction"
 
@@ -187,7 +190,7 @@ runTxSign :: TxBodyFile
 runTxSign (TxBodyFile txbodyFile) skFiles mnw (TxFile txFile) = do
     txbody <- firstExceptT ShelleyTxReadUnsignedTxError . newExceptT $
                 Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
-    sks    <- firstExceptT ShelleyTxReadFileError $
+    sks    <- firstExceptT ShelleyTxReadSigningKeyFileError $
                 mapM readSigningKeyFile skFiles
 
     -- We have to handle Byron and Shelley key witnesses slightly differently
@@ -317,12 +320,12 @@ data SomeWitnessSigningKey
 
 readSigningKeyFile
   :: SigningKeyFile
-  -> ExceptT (Api.FileError Api.TextEnvelopeError) IO SomeWitnessSigningKey
-readSigningKeyFile (SigningKeyFile skfile) =
+  -> ExceptT (Api.FileError SigningKeyDecodeError) IO SomeWitnessSigningKey
+readSigningKeyFile skFile =
     newExceptT $
-      Api.readFileTextEnvelopeAnyOf fileTypes skfile
+      readSigningKeyFileAnyOf textEnvFileTypes bech32FileTypes skFile
   where
-    fileTypes =
+    textEnvFileTypes =
       [ Api.FromSomeType (Api.AsSigningKey Api.AsByronKey)
                           AByronSigningKey
       , Api.FromSomeType (Api.AsSigningKey Api.AsPaymentKey)
@@ -345,6 +348,21 @@ readSigningKeyFile (SigningKeyFile skfile) =
                           AGenesisDelegateExtendedSigningKey
       , Api.FromSomeType (Api.AsSigningKey Api.AsGenesisUTxOKey)
                           AGenesisUTxOSigningKey
+      ]
+
+    bech32FileTypes =
+      [ Api.FromSomeType (Api.AsSigningKey Api.AsByronKey)
+                          AByronSigningKey
+      , Api.FromSomeType (Api.AsSigningKey Api.AsPaymentKey)
+                          APaymentSigningKey
+      , Api.FromSomeType (Api.AsSigningKey Api.AsPaymentExtendedKey)
+                          APaymentExtendedSigningKey
+      , Api.FromSomeType (Api.AsSigningKey Api.AsStakeKey)
+                          AStakeSigningKey
+      , Api.FromSomeType (Api.AsSigningKey Api.AsStakeExtendedKey)
+                          AStakeExtendedSigningKey
+      , Api.FromSomeType (Api.AsSigningKey Api.AsStakePoolKey)
+                          AStakePoolSigningKey
       ]
 
 categoriseWitnessSigningKey :: SomeWitnessSigningKey
@@ -380,7 +398,8 @@ runTxWitness
 runTxWitness (TxBodyFile txbodyFile) witSignKeyFile mbNw (OutputFile oFile) = do
   txbody <- firstExceptT ShelleyTxReadFileError . newExceptT $
               Api.readFileTextEnvelope Api.AsShelleyTxBody txbodyFile
-  someWitSignKey <- firstExceptT ShelleyTxReadFileError $ readSigningKeyFile witSignKeyFile
+  someWitSignKey <- firstExceptT ShelleyTxReadSigningKeyFileError $
+              readSigningKeyFile witSignKeyFile
 
   witness <-
     case (categoriseWitnessSigningKey someWitSignKey, mbNw) of
