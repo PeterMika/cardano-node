@@ -62,3 +62,122 @@ The "atLeast" key indicates that in order to spend this tx output, we require "a
     }
 }
 ```
+### Example of using multi-signature scripts
+
+Let's walk through how one would use a multi-signature script. This is a multistep step process, involving the creation of a multi-signature address, sending ADA to that address followed by gathering the required witnesses in order to spend the ADA from the multi-signature address. We will demonstrate this with an `all` script.
+
+#### Sending ada to a script address
+
+#### Step 1 - Create multi-signature script
+
+You will first need to generate the keys that you require witnessing from via the `cardano-cli shelley  address key-gen ` command. Then you construct the multi-signature script as follows:
+
+```
+cardano-cli -- shelley transaction build-multisig
+  --all
+  --payment-verification-key-file payVerKey1
+  --payment-verification-key-file payVerKey2
+  --payment-verification-key-file payVerKey3
+  --out-file allMultiSigScript
+```
+This will output a JSON file with the `all` format described above.
+
+
+#### Step 2 - Create multi-signature address
+We need a special multi-signature address to use with our multi-signature script. Please note the network magic must match with your network's magic (or if its mainnet use the `--mainnet` flag instead). This can be constructed as follows:
+```
+cardano-cli shelley address build-multisig
+  --script-file allMultiSigScript
+  --testnet-magic 42
+  --out-file script.addr
+```
+
+#### Step 3 - Construct and submit a tx to the multi-signature address
+We then need to construct and submit a tx to send ADA to the multi-signature address.
+
+Construct the tx body:
+```
+cardano-cli shelley transaction build-raw
+    --ttl 1000
+    --fee 0
+    --tx-in utxoinput
+    --tx-out $(cat script.addr)+$amount
+    --out-file txbody
+```
+
+Create the utxo witness:
+
+```
+cabal exec cardano-cli -- shelley transaction witness
+  --tx-body-file txbody
+  --signing-key-file utxoSignKey
+  --testnet-magic 42
+  --out-file utxoWitness
+```
+Assemble the utxo witness and tx body to create the transaction:
+
+```
+cardano-cli shelley transaction sign-witness
+  --tx-body-file txbody
+  --witness-file utxoWitness
+  --out-file anyWitnessesTx
+```
+After submiting the above tx, the inputs associated with the multi-signature address are now "guarded" by the multi-signature script. How do we spend it?
+
+#### Sending ada from a script address
+
+#### Step 1 - Construct the tx body
+
+```
+cardano-cli shelley transaction build-raw \
+    --ttl 1000 \
+    --fee 0 \
+    --tx-in (txin of script address)
+    --tx-out yourspecifiedtxout \
+    --out-file spendScriptTxBody
+```
+
+#### Step 2 - Construct the required witnesses
+
+We need to construct the script witness and the 3 required witnesses set out by the script. We do this as follows:
+
+```
+cabal exec cardano-cli -- shelley transaction witness \
+  --tx-body-file spendScriptTxBody
+  --script-file allMultiSigScript \
+  --testnet-magic 42 \
+  --out-file scriptWitness
+
+cabal exec cardano-cli -- shelley transaction witness
+  --tx-body-file spendScriptTxBody
+  --signing-key-file paySignKey1
+  --testnet-magic 42
+  --out-file key1witness
+
+cabal exec cardano-cli -- shelley transaction witness
+  --tx-body-file spendScriptTxBody
+  --signing-key-file paySignKey2
+  --testnet-magic 42
+  --out-file key2witness
+
+cabal exec cardano-cli -- shelley transaction witness
+  --tx-body-file spendScriptTxBody
+  --signing-key-file paySignKey3
+  --testnet-magic 42
+  --out-file key3witness
+
+```
+
+#### Step 3 - Construct & submit the transaction
+You must assemble the transaction with the script witness and all the required witnesses.
+
+```
+cardano-cli shelley transaction sign-witness
+  --tx-body-file spendScriptTxBody
+  --witness-file scriptWitness
+  --witness-file key1witness
+  --witness-file key2witness
+  --witness-file key3witness
+  --out-file spendMultiSig
+```
+You can now submit this tx!
